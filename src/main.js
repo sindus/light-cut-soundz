@@ -1,5 +1,4 @@
 import { invoke } from '@tauri-apps/api/core'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
@@ -24,41 +23,78 @@ const exportBtn = $('export-btn')
 const playBtn   = $('play-btn')
 const toast     = $('toast')
 
-// ─── Audio playback ──────────────────────────────────────────────────────────
+// ─── Audio playback (Web Audio API) ─────────────────────────────────────────
 
-let audioEl = null
+let audioCtx = null
+let audioBuffer = null
+let audioSource = null
+let playStartCtxTime = 0
+let playStartOffset = 0
 let playRaf = null
 
-function setupAudio(path) {
-  if (audioEl) { audioEl.pause(); cancelAnimationFrame(playRaf) }
-  const url = convertFileSrc(path)
-  audioEl = new Audio(url)
-  audioEl.addEventListener('ended', () => { setPlaying(false); renderWaveform() })
-  audioEl.addEventListener('error', () => {
-    const msg = audioEl.error?.message || 'format non supporté'
-    showToast(`Erreur audio : ${msg}`, 'error')
-    setPlaying(false)
-  })
+async function setupAudio(path) {
+  stopPlayback()
+  audioBuffer = null
+  playStartOffset = 0
+
+  const data = await invoke('get_audio_pcm', { path })
+
+  if (!audioCtx) audioCtx = new AudioContext()
+  if (audioCtx.state === 'suspended') await audioCtx.resume()
+
+  const ab = audioCtx.createBuffer(data.channels, data.samples[0].length, data.sample_rate)
+  for (let ch = 0; ch < data.channels; ch++) {
+    ab.copyToChannel(new Float32Array(data.samples[ch]), ch)
+  }
+  audioBuffer = ab
 }
 
-async function togglePlay() {
-  if (!audioEl) return
-  if (audioEl.paused) {
+function currentPlaybackTime() {
+  if (!audioCtx || !audioSource) return playStartOffset
+  return Math.min(playStartOffset + (audioCtx.currentTime - playStartCtxTime), audioBuffer?.duration ?? 0)
+}
+
+function isPlaying() { return audioSource !== null }
+
+function startPlayback(offset) {
+  if (!audioCtx || !audioBuffer) return
+  stopPlayback()
+  audioSource = audioCtx.createBufferSource()
+  audioSource.buffer = audioBuffer
+  audioSource.connect(audioCtx.destination)
+  playStartOffset = Math.max(0, Math.min(offset, audioBuffer.duration))
+  playStartCtxTime = audioCtx.currentTime
+  audioSource.start(0, playStartOffset)
+  audioSource.onended = () => {
+    audioSource = null
+    playStartOffset = 0
+    setPlaying(false)
+    renderWaveform()
+  }
+}
+
+function stopPlayback() {
+  if (!audioSource) return
+  playStartOffset = currentPlaybackTime()
+  audioSource.onended = null
+  audioSource.stop()
+  audioSource.disconnect()
+  audioSource = null
+}
+
+function togglePlay() {
+  if (!audioBuffer) return
+  if (!isPlaying()) {
     const trimEnabled = $('trim-enabled').checked
     const start = parseFloat($('trim-start').value) || 0
     const end   = parseFloat($('trim-end').value)   || state.info?.duration || 0
-    if (trimEnabled && (audioEl.currentTime < start || audioEl.currentTime >= end)) {
-      audioEl.currentTime = start
-    }
-    try {
-      await audioEl.play()
-      setPlaying(true)
-      tickPlayhead()
-    } catch (err) {
-      showToast('Lecture impossible : ' + err.message, 'error')
-    }
+    let from = playStartOffset
+    if (trimEnabled && (from < start || from >= end)) from = start
+    startPlayback(from)
+    setPlaying(true)
+    tickPlayhead()
   } else {
-    audioEl.pause()
+    stopPlayback()
     setPlaying(false)
     cancelAnimationFrame(playRaf)
   }
@@ -66,17 +102,18 @@ async function togglePlay() {
 
 function tickPlayhead() {
   function frame() {
-    if (!audioEl || audioEl.paused) return
+    if (!isPlaying()) return
+    const t = currentPlaybackTime()
     const trimEnabled = $('trim-enabled').checked
     const end = parseFloat($('trim-end').value) || state.info?.duration || 0
-    if (trimEnabled && audioEl.currentTime >= end) {
-      audioEl.pause()
-      audioEl.currentTime = parseFloat($('trim-start').value) || 0
+    if (trimEnabled && t >= end) {
+      stopPlayback()
+      playStartOffset = parseFloat($('trim-start').value) || 0
       setPlaying(false)
       renderWaveform()
       return
     }
-    $('time-current').textContent = fmtTime(audioEl.currentTime)
+    $('time-current').textContent = fmtTime(t)
     renderWaveform()
     playRaf = requestAnimationFrame(frame)
   }
@@ -127,8 +164,8 @@ function renderWaveform() {
   }
 
   // Playhead
-  if (audioEl && duration > 0) {
-    const px = (audioEl.currentTime / duration) * W
+  if (audioBuffer && duration > 0) {
+    const px = (currentPlaybackTime() / duration) * W
     ctx.save()
     ctx.strokeStyle = 'rgba(255,255,255,0.85)'
     ctx.lineWidth = 1.5
@@ -209,10 +246,14 @@ canvas.addEventListener('mousedown', (e) => {
     return
   }
   // Seek on click
-  if (audioEl && state.info) {
-    audioEl.currentTime = canvasXToTime(e.clientX)
+  if (audioBuffer && state.info) {
+    const t = canvasXToTime(e.clientX)
+    const wasPlaying = isPlaying()
+    if (wasPlaying) { cancelAnimationFrame(playRaf); stopPlayback() }
+    playStartOffset = t
+    if (wasPlaying) { startPlayback(t); setPlaying(true); tickPlayhead() }
     renderWaveform()
-    $('time-current').textContent = fmtTime(audioEl.currentTime)
+    $('time-current').textContent = fmtTime(t)
   }
 })
 
@@ -295,7 +336,7 @@ async function loadFile(path) {
     $('trim-end').value = info.duration.toFixed(1)
     $('trim-end').max   = info.duration
 
-    setupAudio(path)
+    await setupAudio(path)
     setPlaying(false)
 
     dropZone.classList.add('hidden')
@@ -336,7 +377,7 @@ exportBtn.addEventListener('click', async () => {
   })
   if (!outputPath) return
 
-  if (audioEl) { audioEl.pause(); setPlaying(false); cancelAnimationFrame(playRaf) }
+  if (isPlaying()) { stopPlayback(); setPlaying(false); cancelAnimationFrame(playRaf) }
 
   state.processing = true
   exportBtn.disabled = true

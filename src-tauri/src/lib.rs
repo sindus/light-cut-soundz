@@ -12,6 +12,13 @@ struct AudioInfo {
     sample_rate: u32,
 }
 
+#[derive(Serialize)]
+struct AudioPcm {
+    samples: Vec<Vec<f32>>,
+    sample_rate: u32,
+    channels: usize,
+}
+
 #[derive(Deserialize)]
 struct ProcessOptions {
     input: String,
@@ -34,6 +41,16 @@ async fn load_audio(path: String) -> Result<AudioInfo, String> {
         duration: buf.duration_secs(),
         channels: buf.channels,
         sample_rate: buf.sample_rate,
+    })
+}
+
+#[tauri::command]
+async fn get_audio_pcm(path: String) -> Result<AudioPcm, String> {
+    let buf = audio::decode(&path).map_err(|e| e.to_string())?;
+    Ok(AudioPcm {
+        samples: buf.samples,
+        sample_rate: buf.sample_rate,
+        channels: buf.channels,
     })
 }
 
@@ -104,6 +121,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_audio,
+            get_audio_pcm,
             get_waveform,
             process_audio,
         ])
